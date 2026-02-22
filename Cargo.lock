@@ -2191,7 +2191,7 @@ dependencies = [
  "serde_yaml",
  "shared-memory-server",
  "shellexpand 3.1.1",
- "sysinfo",
+ "sysinfo 0.36.1",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -4394,6 +4394,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sysinfo 0.32.1",
  "thiserror 1.0.69",
  "tokio",
  "tower 0.4.13",
@@ -7554,6 +7555,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c33cd241af0f2e9e3b5c32163b873b29956890b5342e6745b917ce9d490f4af"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+ "memchr",
+ "ntapi",
+ "rayon",
+ "windows 0.54.0",
 ]
 
 [[package]]
