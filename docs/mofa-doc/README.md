@@ -52,6 +52,7 @@ docs/mofa-doc/
 │   ├── concepts/          # Core concepts
 │   ├── tutorial/          # Step-by-step tutorial
 │   ├── guides/            # How-to guides
+│   ├── agent-hub/         # Agent hub and catalog docs
 │   ├── api-reference/     # API documentation
 │   ├── examples/          # Example documentation
 │   ├── ffi/               # Cross-language bindings
@@ -89,6 +90,9 @@ cd docs/mofa-doc
 test -f book/index.html && echo "EN OK"
 test -f book/zh/index.html && echo "ZH OK"
 ```
+
+CI also validates mdBook output through the repository workflow:
+- `.github/workflows/ci.yml` (docs job)
 
 ### Manual Deployment
 

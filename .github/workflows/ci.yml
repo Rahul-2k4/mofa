@@ -103,3 +103,17 @@ jobs:
 
       - name: Check docs intra-doc links
         run: cargo doc --workspace --no-deps --all-features --document-private-items
+
+      - name: Install mdBook toolchain
+        run: |
+          cargo install mdbook
+          cargo install mdbook-mermaid
+
+      - name: Build mdBook docs (EN + ZH)
+        working-directory: docs/mofa-doc
+        run: ./scripts/build-docs.sh
+
+      - name: Verify mdBook artifacts
+        run: |
+          test -f docs/mofa-doc/book/index.html
+          test -f docs/mofa-doc/book/zh/index.html

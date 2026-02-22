@@ -50,6 +50,15 @@
 
 ---
 
+# Agent Hub
+
+- [Overview](agent-hub/overview.md)
+- [Catalog](agent-hub/catalog.md)
+- [Integration](agent-hub/integration.md)
+- [Copy to Studio](agent-hub/copy-to-studio.md)
+
+---
+
 # API Reference
 
 - [Kernel](api-reference/kernel/README.md)
