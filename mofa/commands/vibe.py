@@ -457,9 +457,9 @@ def register_vibe_commands(cli_group):
             sys.exit(1)
 
     @vibe.command()
-    @click.option("--llm", default="gpt-4", help="LLM model to use (default: gpt-4)")
+    @click.option("--llm", default=None, help="LLM model to use (default: from config)")
     @click.option(
-        "--output", "-o", default="./flows", help="Output directory (default: ./flows)"
+        "--output", "-o", default=None, help="Output directory (default: from config)"
     )
     def flow(llm, output):
         """Generate a dataflow from natural language description
@@ -468,7 +468,58 @@ def register_vibe_commands(cli_group):
             mofa vibe flow
             mofa vibe flow --llm gpt-4
         """
-        click.echo("Vibe flow generation (not implemented yet)")
-        click.echo(f"LLM: {llm}")
-        click.echo(f"Output: {output}")
-        # TODO: Implement flow generation
+        try:
+            from mofa.vibe.flow_generator import FlowGenerator
+            from dotenv import load_dotenv
+        except ImportError as e:
+            click.echo(f"ERROR: Failed to import vibe module: {e}")
+            click.echo("Make sure all dependencies are installed:")
+            click.echo("  pip install openai rich pyyaml python-dotenv")
+            return
+
+        # Load .env file if it exists
+        env_file = os.path.join(project_root, ".env")
+        if os.path.exists(env_file):
+            load_dotenv(env_file)
+
+        # Check for API key and prompt user if not found
+        api_key = _check_and_setup_api_key()
+        if not api_key:
+            click.echo("Cannot proceed without API key. Exiting...")
+            sys.exit(1)
+
+        # Load saved config for defaults
+        saved_config = _load_vibe_config()
+        if llm is None:
+            llm = saved_config["model"]
+        if output is None:
+            output = saved_config["flows_output"]
+
+        # Save the config for next time
+        _save_vibe_config(model=llm, flows_output=output)
+
+        requirement = click.prompt("Describe the flow (what it should do)")
+
+        try:
+            click.echo("\nScanning agents and generating flow...")
+            generator = FlowGenerator(
+                agents_dir=agents_dir_path,
+                flows_dir=output,
+                llm_model=llm,
+                api_key=api_key,
+            )
+            flow_path = generator.generate_flow(requirement)
+
+            click.echo(f"\n[SUCCESS] Flow created at: {flow_path}")
+            click.echo("\nNext steps:")
+            click.echo(f"  1. Review the flow: {flow_path}")
+            click.echo(f"  2. Run: mofa run-flow {flow_path}/*_dataflow.yml")
+        except KeyboardInterrupt:
+            click.echo("\n\nVibe exited")
+            sys.exit(0)
+        except Exception as e:
+            click.echo(f"\n[ERROR] Flow generation failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            sys.exit(1)
