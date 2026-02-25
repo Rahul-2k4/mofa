@@ -592,9 +592,6 @@ impl AgentPlugin for RhaiPlugin {
         // Save plugin context
         *self.plugin_context.write().await = Some(ctx.clone());
 
-        // Extract metadata from script
-        self.extract_metadata().await?;
-
         let mut state = self.state.write().await;
         *state = RhaiPluginState::Loaded;
         Ok(())
@@ -750,6 +747,21 @@ mod tests {
         assert_eq!(plugin.kernel_metadata.version, "1.0.0");
         assert_eq!(plugin.kernel_metadata.description, "Test Rhai plugin");
         assert!(!plugin.cached_content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_agent_plugin_metadata_available_before_load() {
+        // Verify that the AgentPlugin::metadata() trait method returns the correct
+        // values immediately after construction, without requiring load() first.
+        // This is the core guarantee introduced by issue #491.
+        let plugin = RhaiPlugin::from_content("test-plugin", TEST_PLUGIN_SCRIPT)
+            .await
+            .unwrap();
+
+        let meta = AgentPlugin::metadata(&plugin);
+        assert_eq!(meta.name, "test_rhai_plugin");
+        assert_eq!(meta.version, "1.0.0");
+        assert_eq!(meta.description, "Test Rhai plugin");
     }
 
     #[tokio::test]
