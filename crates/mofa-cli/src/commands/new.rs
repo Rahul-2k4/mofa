@@ -983,13 +983,16 @@ pyyaml>=6.0
     std::fs::write(project_dir.join("requirements.txt"), requirements)?;
 
     // Create agent.yml
+    // Escape backslash and double-quote so the project name is safe in YAML
+    // double-quoted scalars even when it contains those characters.
+    let safe_name = yaml_double_quote_escape(name);
     let agent_yml = format!(
         r#"# MoFA LLM Agent Configuration (Python)
 # This file configures the LLM agent. Edit the values below to customize.
 
 agent:
-  id: "{name}-001"
-  name: "{name}"
+  id: "{safe_name}-001"
+  name: "{safe_name}"
   description: "A helpful LLM-powered assistant (Python)"
   capabilities:
     - llm
@@ -1128,4 +1131,39 @@ bindings/
     std::fs::write(project_dir.join(".gitignore"), gitignore)?;
 
     Ok(())
+}
+
+/// Escape a string for safe use inside a YAML double-quoted scalar.
+///
+/// In YAML double-quoted strings only `\` and `"` need to be escaped.
+fn yaml_double_quote_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn python_template_agent_yml_is_valid_yaml_for_names_with_special_chars() {
+        let tmp = TempDir::new().expect("tempdir");
+        let name = r#"my"agent\project"#;
+        generate_python_template(name, tmp.path()).expect("template generation should succeed");
+
+        let content = std::fs::read_to_string(tmp.path().join("agent.yml"))
+            .expect("agent.yml should be written");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&content).expect("generated agent.yml must be valid YAML");
+
+        assert_eq!(parsed["agent"]["id"], format!("{name}-001"));
+        assert_eq!(parsed["agent"]["name"], name);
+    }
+
+    #[test]
+    fn yaml_double_quote_escape_handles_special_chars() {
+        assert_eq!(yaml_double_quote_escape(r#"foo"bar"#), r#"foo\"bar"#);
+        assert_eq!(yaml_double_quote_escape(r"foo\bar"), r"foo\\bar");
+        assert_eq!(yaml_double_quote_escape("plain"), "plain");
+    }
 }
