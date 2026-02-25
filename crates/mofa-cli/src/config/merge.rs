@@ -106,54 +106,55 @@ pub fn config_from_env(prefix: &str) -> AgentConfig {
     let prefix = prefix.trim_end_matches('_');
 
     // Parse environment variables
+    let prefix_with_sep = format!("{}_", prefix);
     for (key, value) in std::env::vars() {
-        if key.as_str().starts_with(prefix) {
-            let rest = &key[prefix.len()..];
-            let rest = rest.trim_start_matches('_');
+        if !key.starts_with(&prefix_with_sep) {
+            continue;
+        }
+        let rest = &key[prefix_with_sep.len()..];
 
-            let parts: Vec<&str> = rest.split('_').collect();
+        let parts: Vec<&str> = rest.split('_').collect();
 
-            match parts.as_slice() {
-                ["AGENT", "ID"] => config.agent.id = value,
-                ["AGENT", "NAME"] => config.agent.name = value,
-                ["AGENT", "DESCRIPTION"] => config.agent.description = Some(value),
-                ["LLM", "PROVIDER"] => {
-                    config.llm.get_or_insert_with(default_llm_config).provider = value;
-                }
-                ["LLM", "MODEL"] => {
-                    config.llm.get_or_insert_with(default_llm_config).model = value;
-                }
-                ["LLM", "API", "KEY"] => {
-                    config.llm.get_or_insert_with(default_llm_config).api_key = Some(value);
-                }
-                ["LLM", "BASE", "URL"] => {
-                    config.llm.get_or_insert_with(default_llm_config).base_url = Some(value);
-                }
-                ["LLM", "TEMPERATURE"] => {
-                    if let Ok(temp) = value.parse::<f32>() {
-                        config
-                            .llm
-                            .get_or_insert_with(default_llm_config)
-                            .temperature = Some(temp);
-                    }
-                }
-                ["LLM", "MAX", "TOKENS"] => {
-                    if let Ok(tokens) = value.parse::<u32>() {
-                        config.llm.get_or_insert_with(default_llm_config).max_tokens = Some(tokens);
-                    }
-                }
-                ["LLM", "SYSTEM", "PROMPT"] => {
+        match parts.as_slice() {
+            ["AGENT", "ID"] => config.agent.id = value,
+            ["AGENT", "NAME"] => config.agent.name = value,
+            ["AGENT", "DESCRIPTION"] => config.agent.description = Some(value),
+            ["LLM", "PROVIDER"] => {
+                config.llm.get_or_insert_with(default_llm_config).provider = value;
+            }
+            ["LLM", "MODEL"] => {
+                config.llm.get_or_insert_with(default_llm_config).model = value;
+            }
+            ["LLM", "API", "KEY"] => {
+                config.llm.get_or_insert_with(default_llm_config).api_key = Some(value);
+            }
+            ["LLM", "BASE", "URL"] => {
+                config.llm.get_or_insert_with(default_llm_config).base_url = Some(value);
+            }
+            ["LLM", "TEMPERATURE"] => {
+                if let Ok(temp) = value.parse::<f32>() {
                     config
                         .llm
                         .get_or_insert_with(default_llm_config)
-                        .system_prompt = Some(value);
+                        .temperature = Some(temp);
                 }
-                _ => {
-                    // Store in node_config
-                    config
-                        .node_config
-                        .insert(key.as_str().to_lowercase(), serde_json::json!(value));
+            }
+            ["LLM", "MAX", "TOKENS"] => {
+                if let Ok(tokens) = value.parse::<u32>() {
+                    config.llm.get_or_insert_with(default_llm_config).max_tokens = Some(tokens);
                 }
+            }
+            ["LLM", "SYSTEM", "PROMPT"] => {
+                config
+                    .llm
+                    .get_or_insert_with(default_llm_config)
+                    .system_prompt = Some(value);
+            }
+            _ => {
+                // Store in node_config
+                config
+                    .node_config
+                    .insert(key.to_lowercase(), serde_json::json!(value));
             }
         }
     }
@@ -170,5 +171,36 @@ fn default_llm_config() -> super::LlmConfig {
         temperature: None,
         max_tokens: None,
         system_prompt: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_from_env_prefix_boundary() {
+        unsafe {
+            std::env::set_var("MOFA_AGENT_ID", "my-agent");
+            std::env::set_var("MOFA_LLM_MODEL", "gpt-4o");
+            // This key starts with "MOFA" but is NOT separated by "_" at the right boundary
+            std::env::set_var("MOFATEST_AGENT_ID", "should-not-match");
+        }
+
+        let config = config_from_env("MOFA");
+
+        assert_eq!(config.agent.id, "my-agent");
+        assert_eq!(
+            config.llm.as_ref().map(|l| l.model.as_str()),
+            Some("gpt-4o")
+        );
+        // The "MOFATEST_AGENT_ID" key must NOT overwrite the agent id
+        assert_eq!(config.agent.id, "my-agent");
+
+        unsafe {
+            std::env::remove_var("MOFA_AGENT_ID");
+            std::env::remove_var("MOFA_LLM_MODEL");
+            std::env::remove_var("MOFATEST_AGENT_ID");
+        }
     }
 }

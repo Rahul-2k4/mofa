@@ -219,6 +219,8 @@ impl ConfigValidator {
             "ollama".to_string(),
             "azure".to_string(),
             "compatible".to_string(),
+            "anthropic".to_string(),
+            "gemini".to_string(),
         ]);
 
         // Validate provider
@@ -228,7 +230,7 @@ impl ConfigValidator {
                     "llm.provider",
                     format!("Unknown provider: {}", llm.provider),
                 )
-                .with_suggestion("Use: openai, ollama, azure, or compatible"),
+                .with_suggestion("Use: openai, ollama, azure, compatible, anthropic, or gemini"),
             );
         }
 
@@ -411,6 +413,40 @@ mod tests {
 
         assert!(!result.ok());
         assert!(result.errors.iter().any(|e| e.field == "llm.provider"));
+    }
+
+    #[test]
+    fn test_anthropic_and_gemini_are_valid_providers() {
+        let validator = ConfigValidator::new();
+
+        for provider in &["anthropic", "gemini"] {
+            let config = AgentConfig {
+                agent: super::super::AgentIdentity {
+                    id: "test".to_string(),
+                    name: "Test".to_string(),
+                    description: None,
+                    capabilities: None,
+                },
+                llm: Some(super::super::LlmConfig {
+                    provider: provider.to_string(),
+                    model: "model-name".to_string(),
+                    api_key: Some("test-key".to_string()),
+                    base_url: None,
+                    temperature: None,
+                    max_tokens: None,
+                    system_prompt: None,
+                }),
+                runtime: None,
+                node_config: std::collections::HashMap::new(),
+            };
+
+            let result = validator.validate(&config);
+            assert!(
+                result.errors.iter().all(|e| e.field != "llm.provider"),
+                "provider '{}' should be valid but got provider error",
+                provider
+            );
+        }
     }
 
     #[test]

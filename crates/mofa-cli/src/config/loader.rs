@@ -130,15 +130,7 @@ impl ConfigLoader {
             "agent.json5",
         ];
 
-        // Try current directory first
-        for name in &supported_filenames {
-            let path = PathBuf::from(name);
-            if path.exists() {
-                return Some(path);
-            }
-        }
-
-        // Search upward
+        // Search upward from the current directory
         let mut current = std::env::current_dir().ok()?;
         loop {
             for name in &supported_filenames {
