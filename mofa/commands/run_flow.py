@@ -25,6 +25,10 @@ from mofa.utils.process.util import (
     stop_dora_dataflow,
     destroy_dora_daemon,
 )
+from mofa.runtime.validation import (
+    FlowValidationException,
+    validate_and_plan_dataflow_descriptor,
+)
 
 # Global variable to track venv for cleanup
 _venv_root_path = None
@@ -487,6 +491,23 @@ def run_flow(dataflow_file: str, vibe_test_mode: bool = False, detach: bool = Fa
     except Exception as exc:
         click.echo(f"Error: Failed to read dataflow descriptor: {exc}")
         return
+
+    try:
+        validation_report = validate_and_plan_dataflow_descriptor(
+            dataflow_descriptor,
+            source=dataflow_path,
+        )
+    except FlowValidationException as exc:
+        click.echo("Error: Dataflow validation failed.")
+        for issue in exc.issues:
+            click.echo(f"- [{issue.stage}] {issue.message}")
+        return
+
+    warning_diagnostics = [
+        item for item in getattr(validation_report, "diagnostics", ()) if item.severity == "warning"
+    ]
+    for warning in warning_diagnostics:
+        click.echo(f"- [warning:{warning.stage}] {warning.message}")
 
     placeholder_env_vars = collect_placeholder_env_vars(dataflow_descriptor)
     missing_env_vars = [var for var in sorted(placeholder_env_vars) if var not in os.environ]
