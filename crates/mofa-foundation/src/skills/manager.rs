@@ -5,7 +5,7 @@ use super::{
     RequirementCheck, SkillHubClient, SkillHubClientConfig, SkillMetadata, SkillParser,
     SkillRequirements,
 };
-use mofa_foundation::llm::context::SkillsManager as PromptSkillsManager;
+use crate::llm::context::SkillsManager as PromptSkillsManager;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -546,8 +546,8 @@ fn escape_xml(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::context::{AgentContextBuilder, AgentIdentity};
     use axum::{Json, Router, routing::get};
-    use mofa_foundation::llm::context::{AgentContextBuilder, AgentIdentity};
     use serde_json::json;
     use std::fs;
     use std::sync::Arc;

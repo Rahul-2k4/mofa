@@ -102,6 +102,11 @@ pub fn ensure_mofa_data_dir() -> anyhow::Result<PathBuf> {
     ensure_dir(&mofa_data_dir()?)
 }
 
+/// Create the MoFA cache directory if it doesn't exist
+pub fn ensure_mofa_cache_dir() -> anyhow::Result<PathBuf> {
+    ensure_dir(&mofa_cache_dir()?)
+}
+
 /// Normalize a path for display
 pub fn normalize_path<P: AsRef<Path>>(path: P) -> String {
     let path = path.as_ref();

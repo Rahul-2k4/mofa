@@ -68,6 +68,8 @@ pub struct CliContext {
     pub tool_registry: ToolRegistry,
     /// Platform-specific data directory (~/.local/share/mofa or equivalent)
     pub data_dir: PathBuf,
+    /// Platform-specific cache directory (~/.cache/mofa or equivalent)
+    pub cache_dir: PathBuf,
     /// Platform-specific config directory (~/.config/mofa or equivalent)
     pub config_dir: PathBuf,
 }
@@ -76,6 +78,7 @@ impl CliContext {
     /// Initialize the CLI context with default backend services
     pub async fn new() -> anyhow::Result<Self> {
         let data_dir = paths::ensure_mofa_data_dir()?;
+        let cache_dir = paths::ensure_mofa_cache_dir()?;
         let config_dir = paths::ensure_mofa_config_dir()?;
         migrate_legacy_nested_sessions(&data_dir)?;
 
@@ -103,6 +106,7 @@ impl CliContext {
             plugin_registry,
             tool_registry,
             data_dir,
+            cache_dir,
             config_dir,
         })
     }
@@ -112,8 +116,10 @@ impl CliContext {
 impl CliContext {
     pub async fn with_temp_dir(temp_dir: &std::path::Path) -> anyhow::Result<Self> {
         let data_dir = temp_dir.join("data");
+        let cache_dir = temp_dir.join("cache");
         let config_dir = temp_dir.join("config");
         std::fs::create_dir_all(&data_dir)?;
+        std::fs::create_dir_all(&cache_dir)?;
         std::fs::create_dir_all(&config_dir)?;
         migrate_legacy_nested_sessions(&data_dir)?;
 
@@ -141,6 +147,7 @@ impl CliContext {
             plugin_registry,
             tool_registry,
             data_dir,
+            cache_dir,
             config_dir,
         })
     }

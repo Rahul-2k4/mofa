@@ -992,6 +992,11 @@ impl ChatSession {
         self.last_response_metadata.as_ref()
     }
 
+    /// 设置最后一次 LLM 响应的元数据
+    pub fn set_last_response_metadata(&mut self, metadata: super::types::LLMResponseMetadata) {
+        self.last_response_metadata = Some(metadata);
+    }
+
     /// 应用滑动窗口，返回限定后的消息列表
     ///
     /// 保留最近的 N 轮对话（每轮包括用户消息和助手响应）。

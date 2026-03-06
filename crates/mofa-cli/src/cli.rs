@@ -129,6 +129,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: ToolCommands,
     },
+
+    /// Skill hub management
+    Skill {
+        #[command(subcommand)]
+        action: SkillCommands,
+    },
 }
 
 /// Generate subcommands
@@ -441,5 +447,115 @@ pub enum ToolCommands {
     Info {
         /// Tool name
         name: String,
+    },
+}
+
+/// Skill management subcommands
+#[derive(Subcommand)]
+pub enum SkillCommands {
+    /// Search skills from a remote hub catalog
+    Search {
+        /// Search query
+        query: String,
+
+        /// Skills hub catalog endpoint
+        #[arg(long, env = "MOFA_SKILLS_HUB_CATALOG_URL")]
+        catalog_url: Option<String>,
+
+        /// Filter by category
+        #[arg(long)]
+        category: Option<String>,
+    },
+
+    /// List available hub categories
+    Categories {
+        /// Skills hub catalog endpoint override
+        #[arg(long, env = "MOFA_SKILLS_HUB_CATALOG_URL")]
+        catalog_url: Option<String>,
+    },
+
+    /// Show detailed information for a hub skill
+    Info {
+        /// Skill name
+        skill: String,
+
+        /// Skills hub catalog endpoint override
+        #[arg(long, env = "MOFA_SKILLS_HUB_CATALOG_URL")]
+        catalog_url: Option<String>,
+    },
+
+    /// Sync the remote hub catalog into the local cache
+    Sync {
+        /// Skills hub catalog endpoint override
+        #[arg(long, env = "MOFA_SKILLS_HUB_CATALOG_URL")]
+        catalog_url: Option<String>,
+    },
+
+    /// Install a skill from the remote hub catalog
+    Install {
+        /// Skill name or `name@version`
+        skill: String,
+
+        /// Skills hub catalog endpoint
+        #[arg(long, env = "MOFA_SKILLS_HUB_CATALOG_URL")]
+        catalog_url: Option<String>,
+
+        /// Explicit version override
+        #[arg(long = "skill-version")]
+        skill_version: Option<String>,
+    },
+
+    /// List installed hub skills
+    List {
+        /// Skills hub catalog endpoint override
+        #[arg(long, env = "MOFA_SKILLS_HUB_CATALOG_URL")]
+        catalog_url: Option<String>,
+    },
+
+    /// Update installed skills from the hub
+    Update {
+        /// Skill name to update
+        skill: Option<String>,
+
+        /// Update every installed hub skill
+        #[arg(long)]
+        all: bool,
+
+        /// Skills hub catalog endpoint override
+        #[arg(long, env = "MOFA_SKILLS_HUB_CATALOG_URL")]
+        catalog_url: Option<String>,
+    },
+
+    /// Remove an installed hub skill
+    Remove {
+        /// Skill name
+        skill: String,
+
+        /// Skills hub catalog endpoint override
+        #[arg(long, env = "MOFA_SKILLS_HUB_CATALOG_URL")]
+        catalog_url: Option<String>,
+    },
+
+    /// Hub cache management
+    Cache {
+        #[command(subcommand)]
+        action: SkillCacheCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SkillCacheCommands {
+    /// Show cache status
+    Status {
+        /// Skills hub catalog endpoint override
+        #[arg(long, env = "MOFA_SKILLS_HUB_CATALOG_URL")]
+        catalog_url: Option<String>,
+    },
+
+    /// Clear cached catalog data
+    Clear {
+        /// Skills hub catalog endpoint override
+        #[arg(long, env = "MOFA_SKILLS_HUB_CATALOG_URL")]
+        catalog_url: Option<String>,
     },
 }

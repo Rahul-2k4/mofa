@@ -22,6 +22,9 @@ pub mod persistence;
 // llm module
 pub mod llm;
 
+// skills module
+pub mod skills;
+
 // workflow module
 pub mod workflow;
 

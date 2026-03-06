@@ -23,9 +23,12 @@
 //! ```
 
 use super::client::{ChatSession, LLMClient};
+use super::context::{AgentContextBuilder, AgentIdentity, SkillsManager as PromptSkillsManager};
 use super::provider::{ChatStream, LLMProvider};
 use super::tool_executor::ToolExecutor;
-use super::types::{ChatMessage, LLMError, LLMResult, Tool};
+use super::types::{
+    ChatCompletionResponse, ChatMessage, LLMError, LLMResult, MessageContent, Role, Tool,
+};
 use crate::llm::{
     AnthropicConfig, AnthropicProvider, GeminiConfig, GeminiProvider, OllamaConfig, OllamaProvider,
 };
@@ -77,6 +80,10 @@ impl CancellationToken {
 ///
 /// 每次 yield 一个文本片段（delta content）
 pub type TextStream = Pin<Box<dyn Stream<Item = LLMResult<String>> + Send>>;
+
+const HUB_CONFIG_KEY_CATALOG_URL: &str = "skills.hub.catalog_url";
+const HUB_CONFIG_KEY_AUTO_INSTALL: &str = "skills.hub.auto_install";
+const HUB_CONFIG_KEY_COMPATIBILITY_TARGETS: &str = "skills.hub.compatibility_targets";
 
 /// TTS 流句柄：持有 sink 和消费者任务
 ///
@@ -276,6 +283,8 @@ pub struct LLMAgent {
     prompt_plugin: Option<Box<dyn prompt::PromptTemplatePlugin>>,
     /// TTS 插件（通过 builder 配置）
     tts_plugin: Option<Arc<Mutex<TTSPlugin>>>,
+    /// Optional prompt context builder for bootstrap files and skills.
+    context_builder: Option<AgentContextBuilder>,
     /// 缓存的 Kokoro TTS 引擎（只需初始化一次，后续可复用）
     #[cfg(feature = "kokoro")]
     cached_kokoro_engine: Arc<Mutex<Option<Arc<mofa_plugins::tts::kokoro_wrapper::KokoroTTS>>>>,
@@ -439,6 +448,7 @@ impl LLMAgent {
             provider,
             prompt_plugin: None,
             tts_plugin: None,
+            context_builder: None,
             #[cfg(feature = "kokoro")]
             cached_kokoro_engine: Arc::new(Mutex::new(None)),
             active_tts_session: Arc::new(Mutex::new(None)),
@@ -642,6 +652,7 @@ impl LLMAgent {
             provider,
             prompt_plugin: None,
             tts_plugin: None,
+            context_builder: None,
             #[cfg(feature = "kokoro")]
             cached_kokoro_engine: Arc::new(Mutex::new(None)),
             active_tts_session: Arc::new(Mutex::new(None)),
@@ -671,6 +682,154 @@ impl LLMAgent {
         self.active_session_id.read().await.clone()
     }
 
+    async fn resolve_dynamic_system_prompt(&self) -> Option<String> {
+        let mut system_prompt = self.config.system_prompt.clone();
+
+        if let Some(ref plugin) = self.prompt_plugin
+            && let Some(template) = plugin.get_current_template().await
+        {
+            system_prompt = match template.render(&[]) {
+                Ok(prompt) => Some(prompt),
+                Err(_) => self.config.system_prompt.clone(),
+            };
+        }
+
+        system_prompt
+    }
+
+    async fn resolve_session_system_prompt(&self) -> LLMResult<Option<String>> {
+        let base_prompt = self.resolve_dynamic_system_prompt().await;
+
+        if let Some(context_builder) = &self.context_builder {
+            context_builder.clear_cache().await;
+            let context_prompt = context_builder
+                .build_system_prompt()
+                .await
+                .map_err(|e| LLMError::Other(e.to_string()))?;
+            return Ok(Some(match base_prompt {
+                Some(base_prompt) if !base_prompt.trim().is_empty() => {
+                    format!("{}\n\n---\n\n{}", base_prompt, context_prompt)
+                }
+                _ => context_prompt,
+            }));
+        }
+
+        Ok(base_prompt)
+    }
+
+    async fn build_context_messages(
+        &self,
+        history: Vec<ChatMessage>,
+        current: &str,
+        requested_skills: Option<&[String]>,
+    ) -> LLMResult<Vec<ChatMessage>> {
+        let context_builder = self
+            .context_builder
+            .as_ref()
+            .ok_or_else(|| LLMError::Other("context builder is not configured".to_string()))?;
+
+        context_builder.clear_cache().await;
+        let mut messages = if let Some(names) = requested_skills {
+            context_builder
+                .build_messages_with_skills(history, current, None, Some(names))
+                .await
+                .map_err(|e| LLMError::Other(e.to_string()))?
+        } else {
+            context_builder
+                .build_messages(history, current, None)
+                .await
+                .map_err(|e| LLMError::Other(e.to_string()))?
+        };
+
+        if let Some(base_prompt) = self.resolve_dynamic_system_prompt().await {
+            Self::prepend_system_prompt(&mut messages, &base_prompt);
+        }
+
+        Ok(messages)
+    }
+
+    fn prepend_system_prompt(messages: &mut Vec<ChatMessage>, prompt: &str) {
+        if prompt.trim().is_empty() {
+            return;
+        }
+
+        if let Some(first) = messages.first_mut()
+            && first.role == Role::System
+            && let Some(MessageContent::Text(content)) = &mut first.content
+        {
+            let merged = format!("{}\n\n---\n\n{}", prompt, content);
+            *content = merged;
+            return;
+        }
+
+        messages.insert(0, ChatMessage::system(prompt));
+    }
+
+    async fn send_messages(&self, messages: Vec<ChatMessage>) -> LLMResult<ChatCompletionResponse> {
+        let mut builder = self.client.chat().messages(messages);
+
+        if let Some(temp) = self.config.temperature {
+            builder = builder.temperature(temp);
+        }
+
+        if let Some(tokens) = self.config.max_tokens {
+            builder = builder.max_tokens(tokens);
+        }
+
+        if let Some(ref executor) = self.tool_executor {
+            let tools = if self.tools.is_empty() {
+                executor.available_tools().await?
+            } else {
+                self.tools.clone()
+            };
+
+            if !tools.is_empty() {
+                builder = builder.tools(tools);
+            }
+
+            builder = builder.with_tool_executor(executor.clone());
+            return builder.send_with_tools().await;
+        }
+
+        builder.send().await
+    }
+
+    async fn send_stream_messages(&self, messages: Vec<ChatMessage>) -> LLMResult<ChatStream> {
+        let mut builder = self.client.chat().messages(messages);
+
+        if let Some(temp) = self.config.temperature {
+            builder = builder.temperature(temp);
+        }
+
+        if let Some(tokens) = self.config.max_tokens {
+            builder = builder.max_tokens(tokens);
+        }
+
+        builder.send_stream().await
+    }
+
+    fn push_session_messages(
+        session: &mut ChatSession,
+        user_message: &str,
+        assistant_message: &str,
+        metadata: super::types::LLMResponseMetadata,
+    ) {
+        session.messages_mut().push(ChatMessage::user(user_message));
+        session
+            .messages_mut()
+            .push(ChatMessage::assistant(assistant_message));
+
+        if session.context_window_size().is_some() {
+            let current_messages = session.messages().to_vec();
+            *session.messages_mut() = ChatSession::apply_sliding_window_static(
+                &current_messages,
+                session.context_window_size(),
+            );
+        }
+
+        session.set_last_response_metadata(metadata);
+    }
+
     /// 创建新会话
     ///
     /// 返回新会话的 session_id
@@ -684,20 +843,7 @@ impl LLMAgent {
     pub async fn create_session(&self) -> String {
         let mut session = ChatSession::new(LLMClient::new(self.provider.clone()));
 
-        // 使用动态 Prompt 模板（如果可用）
-        let mut system_prompt = self.config.system_prompt.clone();
-
-        if let Some(ref plugin) = self.prompt_plugin
-            && let Some(template) = plugin.get_current_template().await
-        {
-            // 渲染默认模板
-            system_prompt = match template.render(&[]) {
-                Ok(prompt) => Some(prompt),
-                Err(_) => self.config.system_prompt.clone(),
-            };
-        }
-
-        if let Some(ref prompt) = system_prompt {
+        if let Ok(Some(prompt)) = self.resolve_session_system_prompt().await {
             session = session.with_system(prompt.clone());
         }
 
@@ -738,20 +884,7 @@ impl LLMAgent {
         let mut session =
             ChatSession::with_id_str(&session_id, LLMClient::new(self.provider.clone()));
 
-        // 使用动态 Prompt 模板（如果可用）
-        let mut system_prompt = self.config.system_prompt.clone();
-
-        if let Some(ref plugin) = self.prompt_plugin
-            && let Some(template) = plugin.get_current_template().await
-        {
-            // 渲染默认模板
-            system_prompt = match template.render(&[]) {
-                Ok(prompt) => Some(prompt),
-                Err(_) => self.config.system_prompt.clone(),
-            };
-        }
-
-        if let Some(ref prompt) = system_prompt {
+        if let Some(prompt) = self.resolve_session_system_prompt().await? {
             session = session.with_system(prompt.clone());
         }
 
@@ -1435,6 +1568,12 @@ impl LLMAgent {
     ) -> LLMResult<String> {
         let message = message.into();
 
+        if self.context_builder.is_some() {
+            return self
+                .chat_with_session_and_skills(session_id, message, &[])
+                .await;
+        }
+
         // 获取模型名称
         let model = self.provider.default_model();
 
@@ -1488,9 +1627,73 @@ impl LLMAgent {
         Ok(final_response)
     }
 
+    /// Use the specified session and explicitly requested skill names for the prompt.
+    pub async fn chat_with_session_and_skills(
+        &self,
+        session_id: &str,
+        message: impl Into<String>,
+        skill_names: &[String],
+    ) -> LLMResult<String> {
+        let message = message.into();
+
+        let model = self.provider.default_model();
+        let processed_message = if let Some(ref handler) = self.event_handler {
+            match handler.before_chat_with_model(&message, model).await? {
+                Some(msg) => msg,
+                None => return Ok(String::new()),
+            }
+        } else {
+            message
+        };
+
+        let session = self.get_session_arc(session_id).await?;
+        let history = {
+            let session_guard = session.read().await;
+            session_guard.messages().to_vec()
+        };
+
+        let messages = self
+            .build_context_messages(history, &processed_message, Some(skill_names))
+            .await?;
+        let response = self.send_messages(messages).await?;
+        let metadata = super::types::LLMResponseMetadata::from(&response);
+        let response_text = response
+            .content()
+            .ok_or_else(|| LLMError::Other("No content in response".to_string()))?
+            .to_string();
+
+        {
+            let mut session_guard = session.write().await;
+            Self::push_session_messages(
+                &mut session_guard,
+                &processed_message,
+                &response_text,
+                metadata.clone(),
+            );
+        }
+
+        let final_response = if let Some(ref handler) = self.event_handler {
+            match handler
+                .after_chat_with_metadata(&response_text, &metadata)
+                .await?
+            {
+                Some(resp) => resp,
+                None => response_text,
+            }
+        } else {
+            response_text
+        };
+
+        Ok(final_response)
+    }
+
     /// 简单问答（不保留上下文）
     pub async fn ask(&self, question: impl Into<String>) -> LLMResult<String> {
         let question = question.into();
+
+        if self.context_builder.is_some() {
+            return self.ask_with_skills(question, &[]).await;
+        }
 
         let mut builder = self.client.chat();
 
@@ -1546,6 +1749,23 @@ impl LLMAgent {
         }
 
         let response = builder.send().await?;
+        response
+            .content()
+            .map(|s| s.to_string())
+            .ok_or_else(|| LLMError::Other("No content in response".to_string()))
+    }
+
+    /// 简单问答（带显式 skills）
+    pub async fn ask_with_skills(
+        &self,
+        question: impl Into<String>,
+        skill_names: &[String],
+    ) -> LLMResult<String> {
+        let question = question.into();
+        let messages = self
+            .build_context_messages(Vec::new(), &question, Some(skill_names))
+            .await?;
+        let response = self.send_messages(messages).await?;
         response
             .content()
             .map(|s| s.to_string())
@@ -1638,6 +1858,10 @@ impl LLMAgent {
     pub async fn ask_stream(&self, question: impl Into<String>) -> LLMResult<TextStream> {
         let question = question.into();
 
+        if self.context_builder.is_some() {
+            return self.ask_stream_with_skills(question, &[]).await;
+        }
+
         let mut builder = self.client.chat();
 
         if let Some(ref system) = self.config.system_prompt {
@@ -1658,6 +1882,20 @@ impl LLMAgent {
         let chunk_stream = builder.send_stream().await?;
 
         // 转换为纯文本流
+        Ok(Self::chunk_stream_to_text_stream(chunk_stream))
+    }
+
+    /// 流式问答（带显式 skills）
+    pub async fn ask_stream_with_skills(
+        &self,
+        question: impl Into<String>,
+        skill_names: &[String],
+    ) -> LLMResult<TextStream> {
+        let question = question.into();
+        let messages = self
+            .build_context_messages(Vec::new(), &question, Some(skill_names))
+            .await?;
+        let chunk_stream = self.send_stream_messages(messages).await?;
         Ok(Self::chunk_stream_to_text_stream(chunk_stream))
     }
 
@@ -1699,6 +1937,12 @@ impl LLMAgent {
         message: impl Into<String>,
     ) -> LLMResult<TextStream> {
         let message = message.into();
+
+        if self.context_builder.is_some() {
+            return self
+                .chat_stream_with_session_and_skills(session_id, message, &[])
+                .await;
+        }
 
         // 获取模型名称
         let model = self.provider.default_model();
@@ -1744,20 +1988,55 @@ impl LLMAgent {
         // 发送流式请求
         let chunk_stream = builder.send_stream().await?;
 
-        // 在流式处理前，先添加用户消息到历史
-        {
-            let mut session_guard = session.write().await;
-            session_guard
-                .messages_mut()
-                .push(ChatMessage::user(&processed_message));
-        }
-
         // 创建一个包装流，在完成时更新历史并调用事件处理
         let event_handler = self.event_handler.clone().map(Arc::new);
-        let wrapped_stream =
-            Self::create_history_updating_stream(chunk_stream, session, event_handler);
+        let wrapped_stream = Self::create_history_updating_stream(
+            chunk_stream,
+            session,
+            Some(processed_message),
+            event_handler,
+        );
 
         Ok(wrapped_stream)
+    }
+
+    /// 使用指定会话进行流式多轮对话（带显式 skills）
+    pub async fn chat_stream_with_session_and_skills(
+        &self,
+        session_id: &str,
+        message: impl Into<String>,
+        skill_names: &[String],
+    ) -> LLMResult<TextStream> {
+        let message = message.into();
+
+        let model = self.provider.default_model();
+        let processed_message = if let Some(ref handler) = self.event_handler {
+            match handler.before_chat_with_model(&message, model).await? {
+                Some(msg) => msg,
+                None => return Ok(Box::pin(futures::stream::empty())),
+            }
+        } else {
+            message
+        };
+
+        let session = self.get_session_arc(session_id).await?;
+        let history = {
+            let session_guard = session.read().await;
+            session_guard.messages().to_vec()
+        };
+
+        let messages = self
+            .build_context_messages(history, &processed_message, Some(skill_names))
+            .await?;
+        let chunk_stream = self.send_stream_messages(messages).await?;
+
+        let event_handler = self.event_handler.clone().map(Arc::new);
+        Ok(Self::create_history_updating_stream(
+            chunk_stream,
+            session,
+            Some(processed_message),
+            event_handler,
+        ))
     }
 
     /// 获取原始流式响应块（包含完整信息）
@@ -1852,41 +2131,44 @@ impl LLMAgent {
             session_guard.messages().to_vec()
         };
 
-        // 构建请求
-        let mut builder = self.client.chat();
+        let chunk_stream = if self.context_builder.is_some() {
+            let requested_skills: &[String] = &[];
+            let messages = self
+                .build_context_messages(history, &processed_message, Some(requested_skills))
+                .await?;
+            self.send_stream_messages(messages).await?
+        } else {
+            let mut builder = self.client.chat();
 
-        if let Some(ref system) = self.config.system_prompt {
-            builder = builder.system(system.clone());
-        }
+            if let Some(ref system) = self.config.system_prompt {
+                builder = builder.system(system.clone());
+            }
 
-        if let Some(temp) = self.config.temperature {
-            builder = builder.temperature(temp);
-        }
+            if let Some(temp) = self.config.temperature {
+                builder = builder.temperature(temp);
+            }
 
-        if let Some(tokens) = self.config.max_tokens {
-            builder = builder.max_tokens(tokens);
-        }
+            if let Some(tokens) = self.config.max_tokens {
+                builder = builder.max_tokens(tokens);
+            }
 
-        builder = builder.messages(history);
-        builder = builder.user(processed_message.clone());
-
-        let chunk_stream = builder.send_stream().await?;
-
-        // 添加用户消息到历史
-        {
-            let mut session_guard = session.write().await;
-            session_guard
-                .messages_mut()
-                .push(ChatMessage::user(&processed_message));
-        }
+            builder = builder.messages(history);
+            builder = builder.user(processed_message.clone());
+            builder.send_stream().await?
+        };
 
         // 创建 channel 用于传递完整响应
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         // 创建收集完整响应的流
         let event_handler = self.event_handler.clone().map(Arc::new);
-        let wrapped_stream =
-            Self::create_collecting_stream(chunk_stream, session, tx, event_handler);
+        let wrapped_stream = Self::create_collecting_stream(
+            chunk_stream,
+            session,
+            Some(processed_message),
+            tx,
+            event_handler,
+        );
 
         Ok((wrapped_stream, rx))
     }
@@ -1922,6 +2204,7 @@ impl LLMAgent {
     fn create_history_updating_stream(
         chunk_stream: ChatStream,
         session: Arc<RwLock<ChatSession>>,
+        pending_user_message: Option<String>,
         event_handler: Option<Arc<Box<dyn LLMAgentEventHandler>>>,
     ) -> TextStream {
         use super::types::LLMResponseMetadata;
@@ -1931,11 +2214,14 @@ impl LLMAgent {
         let event_handler_clone = event_handler.clone();
         let metadata_collected = Arc::new(tokio::sync::Mutex::new(None::<LLMResponseMetadata>));
         let metadata_collected_clone = metadata_collected.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_clone = completed.clone();
 
         let stream = chunk_stream.filter_map(move |result| {
             let collected = collected.clone();
             let event_handler = event_handler.clone();
             let metadata_collected = metadata_collected.clone();
+            let completed = completed.clone();
             async move {
                 match result {
                     Ok(chunk) => {
@@ -1944,6 +2230,7 @@ impl LLMAgent {
                                 // 最后一个块包含 usage 数据，保存元数据
                                 let metadata = LLMResponseMetadata::from(&chunk);
                                 *metadata_collected.lock().await = Some(metadata);
+                                completed.store(true, Ordering::Relaxed);
                                 return None;
                             }
                             if let Some(ref content) = choice.delta.content
@@ -1970,8 +2257,11 @@ impl LLMAgent {
             .chain(futures::stream::once(async move {
                 let full_response = collected_clone.lock().await.clone();
                 let metadata = metadata_collected_clone.lock().await.clone();
-                if !full_response.is_empty() {
+                if completed_clone.load(Ordering::Relaxed) {
                     let mut session = session.write().await;
+                    if let Some(user_message) = pending_user_message.as_ref() {
+                        session.messages_mut().push(ChatMessage::user(user_message));
+                    }
                     session
                         .messages_mut()
                         .push(ChatMessage::assistant(&full_response));
@@ -1999,7 +2289,7 @@ impl LLMAgent {
             .filter_map(|result| async move {
                 match result {
                     Ok(s) => Some(Ok(s)),
-                    Err(e) if e.to_string() == "__stream_end__" => None,
+                    Err(LLMError::Other(message)) if message == "__stream_end__" => None,
                     Err(e) => Some(Err(e)),
                 }
             });
@@ -2011,6 +2301,7 @@ impl LLMAgent {
     fn create_collecting_stream(
         chunk_stream: ChatStream,
         session: Arc<RwLock<ChatSession>>,
+        pending_user_message: Option<String>,
         tx: tokio::sync::oneshot::Sender<String>,
         event_handler: Option<Arc<Box<dyn LLMAgentEventHandler>>>,
     ) -> TextStream {
@@ -2022,11 +2313,14 @@ impl LLMAgent {
         let event_handler_clone = event_handler.clone();
         let metadata_collected = Arc::new(tokio::sync::Mutex::new(None::<LLMResponseMetadata>));
         let metadata_collected_clone = metadata_collected.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_clone = completed.clone();
 
         let stream = chunk_stream.filter_map(move |result| {
             let collected = collected.clone();
             let event_handler = event_handler.clone();
             let metadata_collected = metadata_collected.clone();
+            let completed = completed.clone();
             async move {
                 match result {
                     Ok(chunk) => {
@@ -2035,6 +2329,7 @@ impl LLMAgent {
                                 // 最后一个块包含 usage 数据，保存元数据
                                 let metadata = LLMResponseMetadata::from(&chunk);
                                 *metadata_collected.lock().await = Some(metadata);
+                                completed.store(true, Ordering::Relaxed);
                                 return None;
                             }
                             if let Some(ref content) = choice.delta.content
@@ -2064,23 +2359,7 @@ impl LLMAgent {
                 let mut processed_response = full_response.clone();
                 let metadata = metadata_collected_clone.lock().await.clone();
 
-                if !full_response.is_empty() {
-                    let mut session = session.write().await;
-                    session
-                        .messages_mut()
-                        .push(ChatMessage::assistant(&processed_response));
-
-                    // 滑动窗口：裁剪历史消息以保持固定大小
-                    let window_size = session.context_window_size();
-                    if window_size.is_some() {
-                        let current_messages = session.messages().to_vec();
-                        *session.messages_mut() = ChatSession::apply_sliding_window_static(
-                            &current_messages,
-                            window_size,
-                        );
-                    }
-
-                    // 调用 after_chat 钩子（带元数据）
+                if completed_clone.load(Ordering::Relaxed) {
                     if let Some(handler) = event_handler_clone {
                         if let Some(meta) = &metadata {
                             if let Ok(Some(resp)) = handler
@@ -2094,6 +2373,24 @@ impl LLMAgent {
                             processed_response = resp;
                         }
                     }
+
+                    let mut session = session.write().await;
+                    if let Some(user_message) = pending_user_message.as_ref() {
+                        session.messages_mut().push(ChatMessage::user(user_message));
+                    }
+                    session
+                        .messages_mut()
+                        .push(ChatMessage::assistant(&processed_response));
+
+                    // 滑动窗口：裁剪历史消息以保持固定大小
+                    let window_size = session.context_window_size();
+                    if window_size.is_some() {
+                        let current_messages = session.messages().to_vec();
+                        *session.messages_mut() = ChatSession::apply_sliding_window_static(
+                            &current_messages,
+                            window_size,
+                        );
+                    }
                 }
 
                 let _ = tx.send(processed_response);
@@ -2103,7 +2400,7 @@ impl LLMAgent {
             .filter_map(|result| async move {
                 match result {
                     Ok(s) => Some(Ok(s)),
-                    Err(e) if e.to_string() == "__stream_end__" => None,
+                    Err(LLMError::Other(message)) if message == "__stream_end__" => None,
                     Err(e) => Some(Err(e)),
                 }
             });
@@ -2136,6 +2433,10 @@ pub struct LLMAgentBuilder {
     persistence_user_id: Option<uuid::Uuid>,
     persistence_tenant_id: Option<uuid::Uuid>,
     persistence_agent_id: Option<uuid::Uuid>,
+    workspace: Option<std::path::PathBuf>,
+    skills_manager: Option<Arc<dyn PromptSkillsManager>>,
+    always_skill_names: Vec<String>,
+    context_builder: Option<AgentContextBuilder>,
 }
 
 impl Default for LLMAgentBuilder {
@@ -2169,6 +2470,10 @@ impl LLMAgentBuilder {
             persistence_user_id: None,
             persistence_tenant_id: None,
             persistence_agent_id: None,
+            workspace: None,
+            skills_manager: None,
+            always_skill_names: Vec::new(),
+            context_builder: None,
         }
     }
 
@@ -2223,6 +2528,30 @@ impl LLMAgentBuilder {
     /// 设置工具执行器
     pub fn with_tool_executor(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
         self.tool_executor = Some(executor);
+        self
+    }
+
+    /// Set the workspace used by the prompt context builder.
+    pub fn with_workspace(mut self, workspace: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace = Some(workspace.into());
+        self
+    }
+
+    /// Attach a skills manager for prompt-context based loading.
+    pub fn with_skills_manager(mut self, skills: Arc<dyn PromptSkillsManager>) -> Self {
+        self.skills_manager = Some(skills);
+        self
+    }
+
+    /// Set skill names that should always be loaded into context.
+    pub fn with_always_skills(mut self, names: Vec<String>) -> Self {
+        self.always_skill_names = names;
+        self
+    }
+
+    /// Attach a fully constructed context builder.
+    pub fn with_context_builder(mut self, context_builder: AgentContextBuilder) -> Self {
+        self.context_builder = Some(context_builder);
         self
     }
 
@@ -2443,11 +2772,36 @@ impl LLMAgentBuilder {
             .with_max_tokens(4096))
     }
 
+    fn build_prompt_context_builder(&self) -> Option<AgentContextBuilder> {
+        if let Some(context_builder) = &self.context_builder {
+            return Some(context_builder.clone());
+        }
+
+        let skills = self.skills_manager.clone()?;
+        let workspace = self
+            .workspace
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+
+        let identity = AgentIdentity::new(
+            self.name.clone().unwrap_or_else(|| self.agent_id.clone()),
+            "AI assistant",
+        );
+
+        Some(
+            AgentContextBuilder::new(workspace)
+                .with_identity(identity)
+                .with_skills(skills)
+                .with_always_skills(self.always_skill_names.clone()),
+        )
+    }
+
     /// 构建 LLM Agent
     ///
     /// # Panics
     /// 如果未设置 provider 则 panic
     pub fn build(self) -> LLMAgent {
+        let context_builder = self.build_prompt_context_builder();
         let provider = self
             .provider
             .expect("LLM provider must be set before building");
@@ -2499,6 +2853,7 @@ impl LLMAgentBuilder {
 
         // 设置 TTS 插件
         agent.tts_plugin = tts_plugin;
+        agent.context_builder = context_builder;
 
         agent
     }
@@ -2507,6 +2862,7 @@ impl LLMAgentBuilder {
     ///
     /// 如果未设置 provider 则返回错误
     pub fn try_build(self) -> LLMResult<LLMAgent> {
+        let context_builder = self.build_prompt_context_builder();
         let provider = self
             .provider
             .ok_or_else(|| LLMError::ConfigError("LLM provider not set".to_string()))?;
@@ -2555,6 +2911,7 @@ impl LLMAgentBuilder {
 
         // 设置 TTS 插件
         agent.tts_plugin = tts_plugin;
+        agent.context_builder = context_builder;
 
         Ok(agent)
     }
@@ -2590,6 +2947,7 @@ impl LLMAgentBuilder {
     ///     .await;
     /// ```
     pub async fn build_async(mut self) -> LLMAgent {
+        let context_builder = self.build_prompt_context_builder();
         let provider = self
             .provider
             .expect("LLM provider must be set before building");
@@ -2696,6 +3054,8 @@ impl LLMAgentBuilder {
             agent.set_event_handler(handler);
         }
 
+        agent.context_builder = context_builder;
+
         agent
     }
 }
@@ -2716,13 +3076,40 @@ impl LLMAgentBuilder {
     ///     .build();
     /// ```
     pub fn from_config_file(path: impl AsRef<std::path::Path>) -> LLMResult<Self> {
+        let path = path.as_ref();
         let config = crate::config::AgentYamlConfig::from_file(path)
             .map_err(|e| LLMError::ConfigError(e.to_string()))?;
-        Self::from_yaml_config(config)
+        let persisted_hub_config = crate::config::load_global_config()
+            .map_err(|e| LLMError::ConfigError(e.to_string()))?;
+        let workspace = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        Self::from_yaml_config_with_sources(config, &workspace, Some(persisted_hub_config), true)
     }
 
     /// 从 YAML 配置创建 Builder
     pub fn from_yaml_config(config: crate::config::AgentYamlConfig) -> LLMResult<Self> {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        Self::from_yaml_config_with_workspace(config, workspace)
+    }
+
+    /// 从 YAML 配置创建 Builder，并显式指定 skills 工作目录
+    pub fn from_yaml_config_with_workspace(
+        config: crate::config::AgentYamlConfig,
+        workspace: impl AsRef<std::path::Path>,
+    ) -> LLMResult<Self> {
+        Self::from_yaml_config_with_sources(config, workspace, None, false)
+    }
+
+    fn from_yaml_config_with_sources(
+        config: crate::config::AgentYamlConfig,
+        workspace: impl AsRef<std::path::Path>,
+        persisted_hub_config: Option<HashMap<String, String>>,
+        include_env_hub_overrides: bool,
+    ) -> LLMResult<Self> {
+        let workspace = workspace.as_ref();
+        let skills_config = config.skills.clone();
         let mut builder = Self::new()
             .with_id(&config.agent.id)
             .with_name(&config.agent.name);
@@ -2742,7 +3129,13 @@ impl LLMAgentBuilder {
             }
         }
 
-        Ok(builder)
+        apply_skills_from_file_config(
+            builder.with_workspace(workspace),
+            workspace,
+            skills_config.as_ref(),
+            persisted_hub_config.as_ref(),
+            include_env_hub_overrides,
+        )
     }
 
     // ========================================================================
@@ -3229,4 +3622,121 @@ pub fn simple_llm_agent(
 /// ```
 pub fn agent_from_config(path: impl AsRef<std::path::Path>) -> LLMResult<LLMAgent> {
     LLMAgentBuilder::from_config_file(path)?.try_build()
+}
+
+fn apply_skills_from_file_config(
+    builder: LLMAgentBuilder,
+    workspace: &std::path::Path,
+    skills_config: Option<&crate::config::SkillsYamlConfig>,
+    persisted_hub_config: Option<&HashMap<String, String>>,
+    include_env_hub_overrides: bool,
+) -> LLMResult<LLMAgentBuilder> {
+    let Some(skills_config) = skills_config else {
+        return Ok(builder);
+    };
+
+    let mut search_dirs: Vec<std::path::PathBuf> = if skills_config.search_dirs.is_empty() {
+        vec![workspace.join("skills")]
+    } else {
+        skills_config
+            .search_dirs
+            .iter()
+            .map(std::path::PathBuf::from)
+            .map(|dir| {
+                if dir.is_absolute() {
+                    dir
+                } else {
+                    workspace.join(dir)
+                }
+            })
+            .collect()
+    };
+
+    if let Some(builtin_dir) = crate::skills::SkillsManager::find_builtin_skills()
+        && !search_dirs.contains(&builtin_dir)
+    {
+        search_dirs.push(builtin_dir);
+    }
+
+    let manager = if let Some(hub) = &skills_config.hub {
+        let hub_config =
+            resolve_skill_hub_config(hub, persisted_hub_config, include_env_hub_overrides)?;
+
+        crate::skills::SkillsManager::with_search_dirs_and_hub(search_dirs, hub_config)
+            .map_err(|e| LLMError::ConfigError(e.to_string()))?
+    } else if search_dirs.len() == 1 {
+        crate::skills::SkillsManager::new(&search_dirs[0])
+            .map_err(|e| LLMError::ConfigError(e.to_string()))?
+    } else {
+        crate::skills::SkillsManager::with_search_dirs(search_dirs)
+            .map_err(|e| LLMError::ConfigError(e.to_string()))?
+    };
+
+    Ok(builder
+        .with_skills_manager(Arc::new(manager))
+        .with_always_skills(skills_config.always_load.clone()))
+}
+
+fn resolve_skill_hub_config(
+    hub: &crate::config::SkillHubYamlConfig,
+    persisted_hub_config: Option<&HashMap<String, String>>,
+    include_env_hub_overrides: bool,
+) -> LLMResult<crate::skills::SkillHubClientConfig> {
+    let mut config =
+        crate::skills::SkillHubClientConfig::new(crate::skills::DEFAULT_SKILLS_HUB_CATALOG_URL);
+
+    if let Some(catalog_url) = persisted_hub_config.and_then(|persisted| {
+        persisted
+            .get(HUB_CONFIG_KEY_CATALOG_URL)
+            .filter(|value| !value.trim().is_empty())
+    }) {
+        config.catalog_url = catalog_url.clone();
+    }
+
+    if let Some(value) = persisted_hub_config
+        .and_then(|persisted| persisted.get(HUB_CONFIG_KEY_AUTO_INSTALL))
+        .and_then(|value| parse_global_bool(value))
+    {
+        config.auto_install_on_miss = value;
+    }
+
+    if let Some(value) = persisted_hub_config
+        .and_then(|persisted| persisted.get(HUB_CONFIG_KEY_COMPATIBILITY_TARGETS))
+    {
+        let targets = crate::config::parse_global_string_list(value);
+        if !targets.is_empty() {
+            config.compatibility_targets = targets;
+        }
+    }
+
+    if include_env_hub_overrides {
+        if let Ok(catalog_url) = std::env::var("MOFA_SKILLS_HUB_CATALOG_URL")
+            && !catalog_url.trim().is_empty()
+        {
+            config.catalog_url = catalog_url;
+        }
+        if let Ok(auto_install) = std::env::var("MOFA_SKILLS_HUB_AUTO_INSTALL")
+            && let Some(enabled) = parse_global_bool(&auto_install)
+        {
+            config.auto_install_on_miss = enabled;
+        }
+    }
+
+    if let Some(catalog_url) = &hub.catalog_url {
+        config.catalog_url = catalog_url.clone();
+    }
+    config.auto_install_on_miss = hub.auto_install;
+    if !hub.compatibility_targets.is_empty() {
+        config.compatibility_targets = hub.compatibility_targets.clone();
+    }
+
+    Ok(config)
+}
+
+fn parse_global_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }

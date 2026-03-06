@@ -49,6 +49,7 @@ async fn run_command(cli: Cli) -> anyhow::Result<()> {
             Commands::Agent(_)
                 | Commands::Plugin { .. }
                 | Commands::Session { .. }
+                | Commands::Skill { .. }
                 | Commands::Tool { .. }
         )
     );
@@ -228,6 +229,69 @@ async fn run_command(cli: Cli) -> anyhow::Result<()> {
                 cli::ToolCommands::Info { name } => {
                     commands::tool::info::run(ctx, &name).await?;
                 }
+            }
+        }
+
+        Some(Commands::Skill { action }) => {
+            let ctx = ctx.as_ref().unwrap();
+            match action {
+                cli::SkillCommands::Search {
+                    query,
+                    catalog_url,
+                    category,
+                } => {
+                    commands::skill::run_search(
+                        ctx,
+                        catalog_url.as_deref(),
+                        &query,
+                        category.as_deref(),
+                    )
+                    .await?;
+                }
+                cli::SkillCommands::Categories { catalog_url } => {
+                    commands::skill::run_categories(ctx, catalog_url.as_deref()).await?;
+                }
+                cli::SkillCommands::Info { skill, catalog_url } => {
+                    commands::skill::run_info(ctx, catalog_url.as_deref(), &skill).await?;
+                }
+                cli::SkillCommands::Sync { catalog_url } => {
+                    commands::skill::run_sync(ctx, catalog_url.as_deref()).await?;
+                }
+                cli::SkillCommands::Install {
+                    skill,
+                    catalog_url,
+                    skill_version,
+                } => {
+                    commands::skill::run_install(
+                        ctx,
+                        catalog_url.as_deref(),
+                        &skill,
+                        skill_version.as_deref(),
+                    )
+                    .await?;
+                }
+                cli::SkillCommands::List { catalog_url } => {
+                    commands::skill::run_list(ctx, catalog_url.as_deref())?;
+                }
+                cli::SkillCommands::Update {
+                    skill,
+                    all,
+                    catalog_url,
+                } => {
+                    commands::skill::run_update(ctx, catalog_url.as_deref(), skill.as_deref(), all)
+                        .await?;
+                }
+                cli::SkillCommands::Remove { skill, catalog_url } => {
+                    commands::skill::run_remove(ctx, catalog_url.as_deref(), &skill)?;
+                }
+                cli::SkillCommands::Cache { action } => match action {
+                    cli::SkillCacheCommands::Status { catalog_url } => {
+                        commands::skill::run_cache_status(ctx, catalog_url.as_deref())?;
+                    }
+                    cli::SkillCacheCommands::Clear { catalog_url } => {
+                        commands::skill::run_cache_clear(ctx, catalog_url.as_deref())?;
+                    }
+                },
             }
         }
 

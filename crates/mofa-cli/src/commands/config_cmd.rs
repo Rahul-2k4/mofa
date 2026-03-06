@@ -1,7 +1,7 @@
 //! `mofa config` command implementation
 
 use colored::Colorize;
-use mofa_kernel::config::{load_config, substitute_env_vars};
+use mofa_kernel::config::substitute_env_vars;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
@@ -108,32 +108,8 @@ pub fn run_path() -> anyhow::Result<()> {
 }
 
 /// Load global configuration from config directory
-fn load_global_config() -> anyhow::Result<HashMap<String, String>> {
-    let config_dir = crate::utils::mofa_config_dir()?;
-    let config_file = config_dir.join("config.yml");
-
-    if !config_file.exists() {
-        return Ok(HashMap::new());
-    }
-
-    let _content = fs::read_to_string(&config_file)?;
-
-    // Use the global config loading
-    let config: Value = load_config(config_file.to_string_lossy().as_ref())
-        .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-
-    let mut result = HashMap::new();
-    if let Some(obj) = config.as_object() {
-        for (key, value) in obj {
-            if let Some(s) = value.as_str() {
-                result.insert(key.clone(), s.to_string());
-            } else {
-                result.insert(key.clone(), value.to_string());
-            }
-        }
-    }
-
-    Ok(result)
+pub(crate) fn load_global_config() -> anyhow::Result<HashMap<String, String>> {
+    mofa_foundation::config::load_global_config()
 }
 
 /// Save global configuration to config directory

@@ -255,7 +255,8 @@ pub mod config {
 
     // Curated top-level re-exports
     pub use mofa_foundation::config::{
-        AgentInfo, AgentYamlConfig, LLMYamlConfig, RuntimeConfig as YamlRuntimeConfig, ToolConfig,
+        AgentInfo, AgentYamlConfig, LLMYamlConfig, RuntimeConfig as YamlRuntimeConfig,
+        SkillHubYamlConfig, SkillsYamlConfig, ToolConfig,
     };
     pub use mofa_runtime::config::FrameworkConfig;
 }
@@ -430,9 +431,9 @@ pub mod prelude {
         AgentCapabilities, AgentCapabilitiesBuilder, AgentContext, AgentError, AgentInput,
         AgentMetadata, AgentOutput, AgentResult, AgentState, MoFAAgent,
     };
-    pub use crate::runtime::{AgentBuilder, AgentRunner, run_agents};
     #[cfg(not(feature = "dora"))]
     pub use crate::runtime::SimpleRuntime;
+    pub use crate::runtime::{AgentBuilder, AgentRunner, run_agents};
     pub use async_trait::async_trait;
 }
 
@@ -515,6 +516,20 @@ pub mod llm {
         }
 
         Ok(OpenAIProvider::with_config(config))
+    }
+
+    /// Create an `LLMAgentBuilder` from config and wire local/hub skills if configured.
+    pub fn builder_from_config_with_skills(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<LLMAgentBuilder, crate::llm::LLMError> {
+        LLMAgentBuilder::from_config_file(path)
+    }
+
+    /// Build an `LLMAgent` from config and wire local/hub skills if configured.
+    pub fn agent_from_config_with_skills(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<LLMAgent, crate::llm::LLMError> {
+        builder_from_config_with_skills(path)?.try_build()
     }
 
     /// Create an Ollama provider from environment variables (no API key required).
@@ -782,9 +797,9 @@ pub mod persistence {
         use std::sync::Arc;
 
         // 1. 初始化数据库
-        let store_arc = PostgresStore::from_env().await.map_err(|e| {
-            crate::llm::LLMError::Other(format!("数据库连接失败: {}", e))
-        })?;
+        let store_arc = PostgresStore::from_env()
+            .await
+            .map_err(|e| crate::llm::LLMError::Other(format!("数据库连接失败: {}", e)))?;
 
         // 2. 从环境变量获取或生成 IDs
         let user_id = std::env::var("USER_ID")

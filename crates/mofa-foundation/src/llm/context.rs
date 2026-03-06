@@ -9,6 +9,7 @@
 use crate::llm::types::{ChatMessage, ContentPart, ImageUrl, MessageContent, Role};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -78,6 +79,7 @@ impl SkillsManager for NoOpSkillsManager {
 }
 
 /// Context builder for agent prompts
+#[derive(Clone)]
 pub struct AgentContextBuilder {
     /// Workspace path
     workspace: PathBuf,
@@ -87,6 +89,8 @@ pub struct AgentContextBuilder {
     identity: AgentIdentity,
     /// Optional skills manager
     skills: Option<Arc<dyn SkillsManager>>,
+    /// Skills that should always be loaded for this context
+    always_skill_names: Vec<String>,
     /// Cached system prompt
     cached_prompt: Arc<RwLock<Option<String>>>,
 }
@@ -106,6 +110,7 @@ impl AgentContextBuilder {
                 icon: None,
             },
             skills: None,
+            always_skill_names: Vec::new(),
             cached_prompt: Arc::new(RwLock::new(None)),
         }
     }
@@ -125,6 +130,12 @@ impl AgentContextBuilder {
     /// Set skills manager
     pub fn with_skills(mut self, skills: Arc<dyn SkillsManager>) -> Self {
         self.skills = Some(skills);
+        self
+    }
+
+    /// Set skills that should always be loaded for this context.
+    pub fn with_always_skills(mut self, names: Vec<String>) -> Self {
+        self.always_skill_names = names;
         self
     }
 
@@ -154,7 +165,8 @@ impl AgentContextBuilder {
 
         // Add skills section if available
         if let Some(skills) = &self.skills {
-            let always_skills = skills.get_always_skills().await;
+            let always_skills =
+                merge_skill_names(&self.always_skill_names, &skills.get_always_skills().await);
             if !always_skills.is_empty() {
                 let content = skills.load_skills_for_context(&always_skills).await;
                 if !content.is_empty() {
@@ -337,6 +349,23 @@ The following skills extend your capabilities. To use a skill, read its document
 mod tests {
     use super::*;
 
+    struct StaticSkillsManager;
+
+    #[async_trait::async_trait]
+    impl SkillsManager for StaticSkillsManager {
+        async fn get_always_skills(&self) -> Vec<String> {
+            vec!["catalog".to_string()]
+        }
+
+        async fn load_skills_for_context(&self, names: &[String]) -> String {
+            names.join(",")
+        }
+
+        async fn build_skills_summary(&self) -> String {
+            "<skills />".to_string()
+        }
+    }
+
     #[test]
     fn test_agent_identity_new() {
         let identity = AgentIdentity::new("test", "Test agent");
@@ -368,4 +397,33 @@ mod tests {
 
         assert_eq!(builder.identity().name, "custom");
     }
+
+    #[tokio::test]
+    async fn test_context_builder_merges_explicit_and_manager_always_skills() {
+        let workspace = std::env::temp_dir();
+        let builder = AgentContextBuilder::new(workspace)
+            .with_skills(Arc::new(StaticSkillsManager))
+            .with_always_skills(vec!["remote".to_string(), "catalog".to_string()]);
+
+        let prompt = builder.build_system_prompt().await.unwrap();
+
+        assert!(prompt.contains("remote,catalog"));
+    }
+}
+
+fn merge_skill_names(explicit: &[String], discovered: &[String]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for name in explicit.iter().chain(discovered.iter()) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            names.push(trimmed.to_string());
+        }
+    }
+
+    names
 }
